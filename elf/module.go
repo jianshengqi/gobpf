@@ -123,6 +123,12 @@ int bpf_attach_xdp(const char *dev_name, int progfd, uint32_t flags)
 */
 import "C"
 
+const (
+	parserVerdictProgramSectionFormat = "sk/skb/{parser,verdict}/<sockmap_name>"
+	programTypeParser                 = "parser"
+	programTypeVerdict                = "verdict"
+)
+
 type Module struct {
 	fileName   string
 	fileReader io.ReaderAt
@@ -137,6 +143,7 @@ type Module struct {
 	tracepointPrograms map[string]*TracepointProgram
 	schedPrograms      map[string]*SchedProgram
 	xdpPrograms        map[string]*XDPProgram
+	skSkbPrograms      map[string]*SkSkbProgram
 
 	compatProbe bool // try to be automatically convert function names depending on kernel versions (SyS_ and __x64_sys_)
 }
@@ -196,6 +203,13 @@ type SchedProgram struct {
 	fd    int
 }
 
+// SkSkbProgram represents a packet parser or redirect program
+type SkSkbProgram struct {
+	Name  string
+	insns *C.struct_bpf_insn
+	fd    int
+}
+
 // XDPProgram represents a XDP hook program
 type XDPProgram struct {
 	Name  string
@@ -212,6 +226,7 @@ func newModule(logSize uint32) *Module {
 		tracepointPrograms: make(map[string]*TracepointProgram),
 		schedPrograms:      make(map[string]*SchedProgram),
 		xdpPrograms:        make(map[string]*XDPProgram),
+		skSkbPrograms:      make(map[string]*SkSkbProgram),
 		log:                make([]byte, logSize),
 	}
 }
@@ -604,6 +619,56 @@ func DetachCgroupProgram(cgroupProg *CgroupProgram, cgroupPath string, attachTyp
 	ret, err := C.bpf_prog_detach(progFd, cgroupFd, uint32(attachType))
 	if ret < 0 {
 		return fmt.Errorf("failed to detach prog from cgroup %q: %v", cgroupPath, err)
+	}
+
+	return nil
+}
+
+// AttachParserVerdictPrograms attaches all parser and verdict programs to their
+// corresponding sockmap
+func (b *Module) AttachParserVerdictPrograms() error {
+	var err error
+	for _, skSkbProg := range b.skSkbPrograms {
+
+		// parse program type and sockmap name
+		secName := skSkbProg.Name
+		programTypeSockmapName := strings.TrimPrefix(secName, "sk/skb/")
+		var programType uint32
+		var sockmapName string
+		if strings.HasPrefix(programTypeSockmapName, programTypeParser+"/") {
+			sockmapName = strings.TrimPrefix(programTypeSockmapName, programTypeParser+"/")
+			programType = uint32(C.BPF_SK_SKB_STREAM_PARSER)
+		} else if strings.HasPrefix(programTypeSockmapName, programTypeVerdict+"/") {
+			sockmapName = strings.TrimPrefix(programTypeSockmapName, programTypeVerdict+"/")
+			programType = uint32(C.BPF_SK_SKB_STREAM_VERDICT)
+		} else {
+			err = fmt.Errorf("section name %s is in the wrong format: %s", secName, parserVerdictProgramSectionFormat)
+			continue
+		}
+
+		// find sockmap
+		sockmap := b.maps[sockmapName]
+		if sockmap == nil {
+			err = fmt.Errorf("failed to find sockmap %s using section format: %s", sockmapName, parserVerdictProgramSectionFormat)
+			continue
+		}
+
+		// attach program to sockmap
+		err = b.AttachSockmapProgramFromFd(sockmap.Fd(), skSkbProg.fd, programType)
+		if err != nil {
+			err = fmt.Errorf("failed to attach program to sockmap %s: %s", sockmapName, err)
+			continue
+		}
+	}
+	return nil
+}
+
+// AttachSockmapProgramFromFd attaches a parser or verdict program to its corresponding sockmap
+func (b *Module) AttachSockmapProgramFromFd(sockmapFd, skSkbProgFd int, programType uint32) error {
+
+	ret, err := C.bpf_prog_attach(C.int(skSkbProgFd), C.int(sockmapFd), programType)
+	if ret < 0 {
+		return err
 	}
 
 	return nil
